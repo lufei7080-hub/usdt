@@ -1,31 +1,42 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "services": {
-    "backend": {
-      "root": "backend",
-      "framework": "fastapi"
+  "version": 2,
+  "builds": [
+    {
+      "src": "backend/server.py",
+      "use": "@vercel/python",
+      "config": {
+        "maxLambdaSize": "50mb"
+      }
     },
-    "frontend": {
-      "root": "frontend",
-      "framework": "create-react-app"
-    },
-    "ops_tool": {
-      "root": "ops_tool",
-      "runtime": "python"
+    {
+      "src": "frontend/package.json",
+      "use": "@vercel/static-build",
+      "config": {
+        "installCommand": "npm ci || npm install",
+        "buildCommand": "CI=false npm run build",
+        "outputDirectory": "build"
+      }
     }
-  },
-  "rewrites": [
+  ],
+  "routes": [
     {
-      "source": "/api/(.*)",
-      "destination": {
-        "service": "backend"
-      }
+      "src": "/api/(.*)",
+      "dest": "/backend/server.py"
     },
     {
-      "source": "/(.*)",
-      "destination": {
-        "service": "frontend"
-      }
+      "handle": "filesystem"
+    },
+    {
+      "src": "/(static/.*)",
+      "dest": "/frontend/$1"
+    },
+    {
+      "src": "/(.*\\.[a-zA-Z0-9]+)$",
+      "dest": "/frontend/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/frontend/index.html"
     }
   ]
 }
