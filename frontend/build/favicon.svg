@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="shieldGradient" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3B82F6;stop-opacity:1" />
+      <stop offset="50%" style="stop-color:#8B5CF6;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#3B82F6;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  
+  <!-- Shield Background -->
+  <path d="M50 5 L85 20 L85 45 Q85 70 50 95 Q15 70 15 45 L15 20 Z" 
+        fill="url(#shieldGradient)" 
+        stroke="#E5D4B5" 
+        stroke-width="2"/>
+  
+  <!-- Inner Shield Detail -->
+  <path d="M50 15 L75 27 L75 45 Q75 63 50 80 Q25 63 25 45 L25 27 Z" 
+        fill="none" 
+        stroke="#E5D4B5" 
+        stroke-width="1.5" 
+        opacity="0.6"/>
+  
+  <!-- Check Mark -->
+  <path d="M35 48 L45 58 L65 38" 
+        fill="none" 
+        stroke="#E5D4B5" 
+        stroke-width="4" 
+        stroke-linecap="round" 
+        stroke-linejoin="round"/>
+  
+  <!-- Currency Symbol -->
+  <text x="50" y="72" 
+        font-family="Arial, sans-serif" 
+        font-size="18" 
+        font-weight="bold" 
+        fill="#E5D4B5" 
+        text-anchor="middle">₪</text>
+</svg>
