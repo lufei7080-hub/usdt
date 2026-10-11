@@ -1,79 +1,57 @@
-# USDT ⇄ ILS Exchange
+# 环境变量
 
-Compliance-first USDT↔ILS exchange website for Israeli users (default language: **Hebrew / RTL**), plus a Windows desktop ops app.
+这些变量填在 Vercel 项目的 **Settings → Environment Variables**。生产环境和预览环境都要填。改完需要重新部署才会生效。
 
-## Project layout
+本地开发写在 `backend/.env`。这个文件不要提交到仓库。
 
+## 必须填写
 
-| Path                | Role                                         |
-| ------------------- | -------------------------------------------- |
-| `frontend/`         | React (CRA + CRACO), i18n `en` / `he` / `ar` |
-| `backend/server.py` | FastAPI + MongoDB (Vercel serverless)        |
-| Desktop app         | `../桌面程序/`（本地运行，不上传 Vercel）                  |
+**MONGO_URL**  
+数据库连接地址，用 MongoDB Atlas 的连接串。名字写成 `MONGODB_URI` 也可以。没有它，聊天、设置、白名单都存不住。
 
+**JWT_SECRET**  
+后台登录用的密钥。自己做一长串随机字符，不要用数据库地址来当密钥。
 
-## Environment variables
+在 PowerShell 里可以这样生成一串：
 
-Set these in Vercel (Production / Preview). See also `部署环境变量说明.txt`:
+```powershell
+[Convert]::ToBase64String((1..48 | ForEach-Object { Get-Random -Maximum 256 }) -as [byte[]])
+```
 
+把结果填进 `JWT_SECRET`。
 
-| Variable                    | Required    | Description                                                            |
-| --------------------------- | ----------- | ---------------------------------------------------------------------- |
-| `MONGO_URL`                 | Yes         | MongoDB Atlas connection string (`MONGODB_URI` also accepted)          |
-| `JWT_SECRET`                | Yes         | Long random secret for admin JWT. **Do not** derive from `MONGO_URL`   |
-| `ADMIN_PATH`                | Recommended | Fallback admin URL path if not set in MongoDB config                   |
-| `CORS_ORIGINS`              | Optional    | Extra allowed origins, comma-separated (e.g. `https://new-domain.com`) |
-| `TG_BOT` / `TG_CHAT_ID`     | Optional    | Telegram ops alerts (Chinese text OK — ops only)                       |
-| `VERCEL_ENV` / `VERCEL_URL` | Auto        | Set by Vercel                                                          |
+## 建议填写
 
+**ADMIN_PATH**  
+后台入口路径，例如 `/my-secret-admin`。  
+第一次还没在后台保存过路径时，用这个值作为入口。之后以后台「设置」里保存的路径为准。
 
-See `backend/.env.example`. `backend/.env` is gitignored and must never be committed.  
-`JWT_SECRET=` [Convert]::ToBase64String((1..48 | ForEach-Object { Get-Random -Maximum 256 }) -as [byte[]])
+## 可选
 
-## Admin entry
+**CORS_ORIGINS**  
+额外允许访问接口的网址，多个用英文逗号隔开，例如 `https://example.com,https://www.example.com`。  
+默认已经允许本机和现有正式域名。换了新域名再填这项。
 
-1. Set `adminPath` in MongoDB `config` (or `ADMIN_PATH` env).
-2. Open `https://your-domain{adminPath}` (hidden path, not linked publicly).
-3. Log in with the admin access key stored as a **bcrypt hash** in MongoDB.
-4. Production refuses the built-in development default password.
+**TG_WEBHOOK_SECRET**  
+只有要用 Telegram 机器人接收指令（比如把 IP 加入白名单）时才填。自己定一串密码，用来确认请求确实来自 Telegram。  
+不填也能收消息提醒。提醒用的机器人 Token 和聊天 ID 不在这里填，到后台「设置」里填，并用开关控制是否推送。
 
-## Default language
+**DEEPSEEK_API_KEY**  
+可选。不填时，后台翻译走谷歌。填了之后，后台可以改用 DeepSeek。  
+`DEEPSEEK_BASE_URL`、`DEEPSEEK_MODEL` 一般不用改。
 
-- Default: Hebrew (`he`), `dir=rtl`
-- Switcher: English / Hebrew / Arabic
-- API errors are English codes; the frontend maps them via `apiErrors.js` + `translations.js`
+**REACT_APP_API_URL**  
+只给本地开发用，前端把接口转到这个地址，例如 `http://127.0.0.1:8000`。线上不用填。
 
-## Deploy (Vercel)
+## 不用自己填
 
-1. Connect the repo; **Root Directory = repository root** (the folder that contains `vercel.json`, not `frontend/`).
-2. Configure env vars above (`MONGO_URL`, `JWT_SECRET`, `ADMIN_PATH`).
-3. Atlas Network Access: allow Vercel egress (or `0.0.0.0/0` if needed).
-4. Frontend build uses **npm** + `frontend/package-lock.json` (`npm ci` / `npm run build` in `vercel.json`).
-5. Preview/production on `*.vercel.app` is allowed via CORS; custom domains can also be listed in `CORS_ORIGINS`.
-6. After deploy, smoke-test: homepage → `/api/health` or `/api/config` → open chat → ping presence.
+**VERCEL_ENV**、**VERCEL_URL**  
+Vercel 部署时自动带上。
 
-> Note: This project uses the legacy `builds` + `routes` style in `vercel.json` (Python API + CRA frontend in one repo). Do **not** mix a top-level `functions` block with `builds` — Vercel will fail the deployment.
+## 怎么配
 
-Python Lambda size limit is set via `maxLambdaSize` on the Python build. For `maxDuration` / memory, set them in the Vercel project **Settings → Functions** if needed.
-
-**Image uploads:** capped at **4MB** to stay under Vercel’s serverless request body limit (~4.5MB).
-
-## Security notes
-
-- Admin password is hashed (bcrypt); `GET /api/admin/config` never returns the plaintext password.
-- Visitor chat reads require `session_id` + `visitor_phone` (header/query).
-- Chat images use short-lived signed URLs.
-- Login and chat write endpoints are IP rate-limited in MongoDB.
-- Chat data retention: **72 hours** without interaction — session, messages, and images are auto-deleted (TTL + cleanup job, including GridFS).
-
-## Desktop ops app
-
-- Source: separate Windows app repo `wy-exchange-admin` (CustomTkinter + WebView2 chat)
-- Build via that repo’s `build.bat` / `build.py`
-- Config/session: Windows `%LOCALAPPDATA%\ExchangeAdmin\` (encrypted)
-- Ops UI language: Chinese; chat bubbles keep Hebrew/RTL; times use `Asia/Jerusalem` 24h
-
-## Legal pages
-
-- `/terms`, `/privacy` — real routes (Footer Contact opens live chat)
-
+1. 打开 Vercel 里这个项目，进入 Settings → Environment Variables。
+2. 加上 `MONGO_URL` 和 `JWT_SECRET`。
+3. 需要隐藏后台地址时，加上 `ADMIN_PATH`。
+4. 保存后重新部署。
+5. 用后台路径登录，在「设置」里填写 Telegram，并选择是否打开 Telegram 推送和系统通知。两项开关默认都是开的。

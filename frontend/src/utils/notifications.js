@@ -14,7 +14,6 @@ export const requestNotificationPermission = async () => {
 export const showBrowserNotification = ({ title, body, tag, onClick }) => {
   if (typeof window === 'undefined' || !('Notification' in window)) return false;
   if (Notification.permission !== 'granted') return false;
-  if (document.visibilityState === 'visible') return false;
 
   try {
     const n = new Notification(title, { body, tag, icon: '/favicon.svg' });

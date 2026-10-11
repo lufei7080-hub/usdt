@@ -21,7 +21,7 @@ _BACKEND_DIR = Path(__file__).resolve().parent
 if str(_BACKEND_DIR) not in sys.path:
     sys.path.insert(0, str(_BACKEND_DIR))
 
-from fastapi import FastAPI, Request, HTTPException, Depends, BackgroundTasks, Query, UploadFile, File, Form
+from fastapi import FastAPI, Request, HTTPException, Depends, Query, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -148,6 +148,10 @@ WELCOME_MESSAGE_CLIENT_ID = "system:welcome"
 CLEANUP_INTERVAL_SECONDS = 10 * 60
 UNREAD_NOTIFY_SECONDS = 90
 UNREAD_NOTIFY_CHECK_INTERVAL_SECONDS = 15
+REPLY_LANGS = ("he", "ar", "en")
+TG_PUSH_MAX_SESSIONS = 10
+TG_PUSH_MAX_MESSAGES = 8
+TG_PUSH_MAX_CHARS = 3500
 _last_cleanup_run_at = 0.0
 _last_unread_notify_check_at = 0.0
 _cleanup_lock = asyncio.Lock()
@@ -384,6 +388,10 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
 class AdminConfigUpdate(BaseModel):
     adminPath: str = DEFAULT_ADMIN_PATH
     adminPassword: str = Field(default="", description="Leave empty to keep current password")
+    tgBot: str = ""
+    tgChatId: str = ""
+    tgPushEnabled: bool = True
+    browserPushEnabled: bool = True
 
 class LoginRequest(BaseModel):
     password: str
@@ -422,6 +430,10 @@ class AdminSessionNote(BaseModel):
 
 class AdminSessionGender(BaseModel):
     gender: str = "male"  # male | female
+
+
+class AdminSessionReplyLang(BaseModel):
+    reply_lang: str = "he"  # he | ar | en — outbound language for this chat only
 
 
 class AdminTranslateRequest(BaseModel):
@@ -700,15 +712,6 @@ def _parse_iso_datetime(value) -> Optional[datetime]:
     except Exception:
         return None
 
-def _session_last_activity(session: dict) -> Optional[datetime]:
-    """Latest of last_message_at, last_seen_at, created_at (naive UTC)."""
-    times = []
-    for key in ("last_message_at", "last_seen_at", "created_at"):
-        dt = _parse_iso_datetime(session.get(key))
-        if dt is not None:
-            times.append(dt)
-    return max(times) if times else None
-
 async def delete_session_completely(session_id: str) -> bool:
     """Remove one session and all related messages + GridFS images."""
     if not session_id:
@@ -947,22 +950,15 @@ async def read_and_validate_image(file: UploadFile) -> tuple[bytes, str]:
         raise HTTPException(status_code=400, detail="IMAGE_TOO_LARGE")
     return file_bytes, mime_type
 
-TELEGRAM_BOT_TOKEN = (
-    os.environ.get("TG_BOT")
-    or os.environ.get("TELEGRAM_BOT_TOKEN")
-    or ""
-).strip()
-TELEGRAM_CHAT_ID = (
-    os.environ.get("TG_CHAT_ID")
-    or os.environ.get("TELEGRAM_CHAT_ID")
-    or ""
-).strip()
 # Optional: Telegram setWebhook secret_token ↔ header X-Telegram-Bot-Api-Secret-Token
 TG_WEBHOOK_SECRET = (
     os.environ.get("TG_WEBHOOK_SECRET")
     or os.environ.get("TELEGRAM_WEBHOOK_SECRET")
     or ""
 ).strip()
+_tg_cache = None
+_tg_cache_at = 0.0
+TG_CONFIG_CACHE_SECONDS = 15
 
 _IPV4_RE = re.compile(
     r"(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)"
@@ -1072,6 +1068,7 @@ async def ip_block_middleware(request: Request, call_next):
     if (
         path.startswith("/api/admin/")
         or path.startswith("/api/telegram/")
+        or path.startswith("/api/internal/")
         or path == "/api/health"
     ):
         return await call_next(request)
@@ -1171,16 +1168,22 @@ async def health_check():
 
 @app.get("/api/config")
 async def get_public_config():
-    # Used as a lightweight public probe (also triggers region middleware).
-    return {"ok": True}
+    # Lightweight public probe. Also tells visitors whether system notifications are on.
+    settings = await get_notify_settings()
+    return {"ok": True, "browserPushEnabled": bool(settings.get("browser_push", True))}
 
 @app.get("/api/admin/config")
 async def get_admin_config(token_data: dict = Depends(verify_token)):
     config = await get_config_doc()
+    settings = await get_notify_settings()
     return {
         "adminPath": resolve_admin_path(config),
         "adminPassword": "",
         "passwordSet": password_is_configured(config),
+        "tgBot": settings.get("token") or "",
+        "tgChatId": settings.get("chat_id") or "",
+        "tgPushEnabled": bool(settings.get("tg_push", True)),
+        "browserPushEnabled": bool(settings.get("browser_push", True)),
     }
 
 @app.post("/api/admin/config")
@@ -1208,13 +1211,18 @@ async def update_admin_config(config: AdminConfigUpdate, token_data: dict = Depe
         else:
             raise HTTPException(status_code=400, detail="PASSWORD_TOO_SHORT")
 
-    # Only update path + password; drop legacy public rate fields if still in DB
+    # Only update path, password, and Telegram reminder. Drop legacy public rate fields.
     config_data["adminPath"] = new_path
+    config_data["tgBot"] = (config_data.get("tgBot") or "").strip()[:200]
+    config_data["tgChatId"] = (config_data.get("tgChatId") or "").strip()[:64]
+    config_data["tgPushEnabled"] = bool(config_data.get("tgPushEnabled", True))
+    config_data["browserPushEnabled"] = bool(config_data.get("browserPushEnabled", True))
     await config_collection.update_one(
         {},
         {"$set": config_data, "$unset": {"buyRate": "", "sellRate": ""}},
         upsert=True,
     )
+    invalidate_telegram_cache()
     return {"message": "CONFIG_SAVED"}
 
 # ==========================================
@@ -1286,39 +1294,130 @@ def serialize_message(doc: dict, session_id: str = "") -> dict:
         msg["image_url"] = f"/api/chat/images/{msg['image_id']}"
     return msg
 
-async def send_telegram(text: str, chat_id: str = ""):
-    if not TELEGRAM_BOT_TOKEN:
+def normalize_reply_lang(raw: str) -> str:
+    lang = (raw or "").strip().lower()
+    return lang if lang in REPLY_LANGS else "he"
+
+
+def invalidate_telegram_cache() -> None:
+    global _tg_cache, _tg_cache_at
+    _tg_cache = None
+    _tg_cache_at = 0.0
+
+
+def _bool_setting(config: dict, key: str, default: bool = True) -> bool:
+    """Missing values stay at the default. Explicit false turns a switch off."""
+    if not config or key not in config:
+        return default
+    value = config.get(key)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    text = str(value or "").strip().lower()
+    if text in ("0", "false", "off", "no", "关"):
         return False
-    cid = (chat_id or TELEGRAM_CHAT_ID or "").strip()
+    if text in ("1", "true", "on", "yes", "开"):
+        return True
+    return default
+
+
+def _env_telegram_pair() -> tuple[str, str]:
+    token = (os.environ.get("TG_BOT") or os.environ.get("TELEGRAM_BOT_TOKEN") or "").strip()
+    chat_id = (os.environ.get("TG_CHAT_ID") or os.environ.get("TELEGRAM_CHAT_ID") or "").strip()
+    return token[:200], chat_id[:64]
+
+
+async def get_notify_settings() -> dict:
+    """Telegram credentials plus the two push switches. Missing switches stay on."""
+    global _tg_cache, _tg_cache_at
+    now = time.time()
+    if isinstance(_tg_cache, dict) and now - _tg_cache_at < TG_CONFIG_CACHE_SECONDS:
+        return _tg_cache
+
+    config = await get_config_doc()
+    has_saved = "tgBot" in config or "tgChatId" in config
+    token = (config.get("tgBot") or "").strip()
+    chat_id = (config.get("tgChatId") or "").strip()
+    if not has_saved:
+        env_token, env_chat = _env_telegram_pair()
+        if env_token or env_chat:
+            try:
+                ensure_mongo_context()
+                await config_collection.update_one(
+                    {},
+                    {"$set": {"tgBot": env_token, "tgChatId": env_chat}},
+                    upsert=True,
+                )
+                token, chat_id = env_token, env_chat
+            except Exception as e:
+                logger.warning("telegram settings migrate failed: %s", e)
+                token, chat_id = env_token, env_chat
+    _tg_cache = {
+        "token": token,
+        "chat_id": chat_id,
+        "tg_push": _bool_setting(config, "tgPushEnabled", True),
+        "browser_push": _bool_setting(config, "browserPushEnabled", True),
+    }
+    _tg_cache_at = now
+    return _tg_cache
+
+
+async def get_telegram_credentials() -> tuple[str, str]:
+    """Bot token and chat id from admin settings. Both must be set before any Telegram check."""
+    settings = await get_notify_settings()
+    return settings.get("token") or "", settings.get("chat_id") or ""
+
+
+async def send_telegram(text: str, chat_id: str = "") -> bool:
+    """Return True only when Telegram accepts the message."""
+    token, default_chat = await get_telegram_credentials()
+    if not token:
+        return False
+    cid = (chat_id or default_chat or "").strip()
     if not cid:
         return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     async with httpx.AsyncClient() as client:
         try:
-            await client.post(
+            res = await client.post(
                 url,
                 json={"chat_id": cid, "text": text},
                 timeout=10.0,
             )
-            return True
-        except Exception:
+        except Exception as e:
+            logger.warning("telegram send failed: %s", e)
             return False
-
-
-def _telegram_chat_allowed(chat_id) -> bool:
-    """Only accept whitelist commands from the configured ops chat."""
-    if not TELEGRAM_CHAT_ID:
+    if res.status_code != 200:
+        logger.warning("telegram send HTTP %s: %s", res.status_code, (res.text or "")[:300])
         return False
-    return str(chat_id).strip() == str(TELEGRAM_CHAT_ID).strip()
+    try:
+        data = res.json()
+    except Exception:
+        logger.warning("telegram send returned non-JSON")
+        return False
+    if not data.get("ok"):
+        logger.warning("telegram send rejected: %s", data.get("description") or data)
+        return False
+    return True
+
+
+async def _telegram_chat_allowed(chat_id) -> bool:
+    """Only accept whitelist commands from the configured ops chat."""
+    _token, expected = await get_telegram_credentials()
+    if not expected:
+        return False
+    return str(chat_id).strip() == str(expected).strip()
 
 
 @app.post("/api/telegram/webhook")
 async def telegram_webhook(request: Request):
     """
     Telegram Bot webhook: ops user sends an IP (or multiple) → add to whitelist.
-    Secure with TG_WEBHOOK_SECRET + only TELEGRAM_CHAT_ID is accepted.
+    Secure with TG_WEBHOOK_SECRET + only the configured chat id is accepted.
     """
-    if not TELEGRAM_BOT_TOKEN:
+    token, _chat_id = await get_telegram_credentials()
+    if not token:
         return {"ok": True}
 
     if TG_WEBHOOK_SECRET:
@@ -1341,7 +1440,7 @@ async def telegram_webhook(request: Request):
 
     chat = message.get("chat") or {}
     chat_id = chat.get("id")
-    if not _telegram_chat_allowed(chat_id):
+    if not await _telegram_chat_allowed(chat_id):
         # Ignore other chats silently (do not leak that a webhook exists)
         return {"ok": True}
 
@@ -1388,7 +1487,8 @@ async def setup_telegram_webhook(
     token_data: dict = Depends(verify_token),
 ):
     """Register Telegram webhook URL for this deployment (one-time after deploy)."""
-    if not TELEGRAM_BOT_TOKEN:
+    token, _chat_id = await get_telegram_credentials()
+    if not token:
         raise HTTPException(status_code=503, detail="TELEGRAM_NOT_CONFIGURED")
     base = public_base_url(request)
     if not base:
@@ -1401,7 +1501,7 @@ async def setup_telegram_webhook(
     }
     if TG_WEBHOOK_SECRET:
         payload["secret_token"] = TG_WEBHOOK_SECRET
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook"
+    url = f"https://api.telegram.org/bot{token}/setWebhook"
     try:
         async with httpx.AsyncClient() as client:
             res = await client.post(url, json=payload, timeout=20.0)
@@ -1422,92 +1522,165 @@ async def setup_telegram_webhook(
     }
 
 
-async def notify_new_session(
-    visitor_name: str,
-    visitor_phone: str,
-    session_id: str,
-    visitor_ip: str = "",
-):
-    """Telegram: new visitor/session only (no visit pings, no per-message spam)."""
-    ip = (visitor_ip or "").strip()
-    text = (
-        f"🆕 新用户进线\n\n"
-        f"姓名：{visitor_name}\n"
-        f"手机：{visitor_phone}\n"
-        f"IP：{ip or '-'}\n"
-        f"会话：{session_id[:8]}..."
+def _unread_cutoff_iso() -> str:
+    return (
+        datetime.now(timezone.utc) - timedelta(seconds=UNREAD_NOTIFY_SECONDS)
+    ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+async def _translate_ops_line(text: str) -> str:
+    """Chinese for ops Telegram. Google only, so a slow provider cannot drop the push."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    try:
+        from translate import translate_text
+
+        result = await asyncio.to_thread(translate_text, raw, "zh", "google", "male")
+        out = (result.get("text") or "").strip()
+        return out or raw
+    except Exception as e:
+        logger.warning("ops translate failed, sending original: %s", e)
+        return raw
+
+
+async def _stale_visitor_messages(session_id: str, through: str, cutoff: str) -> list:
+    query = {
+        "session_id": session_id,
+        "sender": "visitor",
+        "created_at": {"$lte": cutoff},
+    }
+    if through:
+        query["created_at"]["$gt"] = through
+    cursor = chat_messages_collection.find(
+        query,
+        {"_id": 0, "type": 1, "content": 1, "created_at": 1},
+    ).sort("created_at", 1)
+    return await cursor.to_list(length=TG_PUSH_MAX_MESSAGES)
+
+
+async def _claim_unread_push(session_id: str, previous_through: str, latest_created_at: str) -> bool:
+    query = {"session_id": session_id, "unread_admin": {"$gt": 0}}
+    if previous_through:
+        query["tg_notified_through"] = previous_through
+    else:
+        query["tg_notified_through"] = {"$exists": False}
+    result = await chat_sessions_collection.update_one(
+        query,
+        {"$set": {"tg_notified_through": latest_created_at}},
     )
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        if ip:
-            await auto_whitelist_many([ip], "telegram-notify")
-        await send_telegram(text)
+    return result.modified_count == 1
 
 
-async def notify_unread_reminder(session: dict):
-    """Telegram: unread still not opened by admin after UNREAD_NOTIFY_SECONDS."""
-    if not session:
-        return
-    name = session.get("visitor_name") or "Guest"
-    phone = session.get("visitor_phone") or "-"
-    ip = (session.get("visitor_ip") or "").strip()
+async def _release_unread_push(session_id: str, claimed_through: str, previous_through: str) -> None:
+    if previous_through:
+        update = {"$set": {"tg_notified_through": previous_through}}
+    else:
+        update = {"$unset": {"tg_notified_through": ""}}
+    await chat_sessions_collection.update_one(
+        {"session_id": session_id, "tg_notified_through": claimed_through},
+        update,
+    )
+
+
+async def notify_unread_batch(session: dict, lines: list) -> bool:
+    """Push phone, note, and translated unread text. No visit or first-join alerts."""
+    phone = (session.get("visitor_phone") or "").strip() or "-"
+    note = (session.get("admin_note") or "").strip() or "无"
+    body = "\n".join(line for line in lines if line).strip() or "无"
+    text = f"号码：{phone}\n备注：{note}\n内容：\n{body}"
+    if len(text) > TG_PUSH_MAX_CHARS:
+        text = text[: TG_PUSH_MAX_CHARS - 1] + "…"
+    return await send_telegram(text)
+
+
+async def _push_one_stale_session(session: dict, cutoff: str) -> None:
     sid = session.get("session_id") or ""
-    preview = (session.get("last_message") or "")[:200]
-    unread = int(session.get("unread_admin") or 0)
-    text = (
-        f"⏰ 未读消息提醒（{UNREAD_NOTIFY_SECONDS}秒未查看）\n\n"
-        f"姓名：{name}\n"
-        f"手机：{phone}\n"
-        f"IP：{ip or '-'}\n"
-        f"未读：{unread}\n"
-        f"会话：{(sid[:8] + '...') if sid else '-'}\n"
-        f"内容：{preview}"
-    )
-    await send_telegram(text)
+    if not sid:
+        return
+    # Old flag meant this unread streak was already pushed. Do not send it again.
+    if session.get("unread_tg_notified") and not session.get("tg_notified_through"):
+        seed = session.get("last_message_at") or utc_now_iso()
+        await chat_sessions_collection.update_one(
+            {
+                "session_id": sid,
+                "unread_tg_notified": True,
+                "tg_notified_through": {"$exists": False},
+            },
+            {"$set": {"tg_notified_through": seed}},
+        )
+        return
+
+    through = (session.get("tg_notified_through") or "").strip()
+    messages = await _stale_visitor_messages(sid, through, cutoff)
+    if not messages:
+        return
+    latest = messages[-1].get("created_at") or ""
+    if not latest:
+        return
+    if not await _claim_unread_push(sid, through, latest):
+        return
+
+    lines = []
+    try:
+        for msg in messages:
+            if msg.get("type") == "image":
+                lines.append("[图片]")
+                continue
+            lines.append(await _translate_ops_line(msg.get("content") or ""))
+        ok = await notify_unread_batch(session, lines)
+    except Exception as e:
+        logger.warning("unread telegram notify failed for %s: %s", sid, e)
+        ok = False
+    if not ok:
+        await _release_unread_push(sid, latest, through)
 
 
-async def maybe_notify_stale_unread():
-    """Serverless-friendly: periodically notify if unread sits >90s without admin view."""
+async def maybe_notify_stale_unread(force: bool = False):
+    """Notify when visitor text is still unopened after 90s. Does not require a page visit."""
     global _last_unread_notify_check_at
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    settings = await get_notify_settings()
+    if not settings.get("tg_push") or not settings.get("token") or not settings.get("chat_id"):
         return
     now = time.time()
-    if now - _last_unread_notify_check_at < UNREAD_NOTIFY_CHECK_INTERVAL_SECONDS:
+    if not force and now - _last_unread_notify_check_at < UNREAD_NOTIFY_CHECK_INTERVAL_SECONDS:
         return
     if _unread_notify_lock.locked():
         return
     async with _unread_notify_lock:
         now2 = time.time()
-        if now2 - _last_unread_notify_check_at < UNREAD_NOTIFY_CHECK_INTERVAL_SECONDS:
+        if not force and now2 - _last_unread_notify_check_at < UNREAD_NOTIFY_CHECK_INTERVAL_SECONDS:
             return
         _last_unread_notify_check_at = time.time()
         try:
             ensure_mongo_context()
-            cutoff = (
-                datetime.now(timezone.utc) - timedelta(seconds=UNREAD_NOTIFY_SECONDS)
-            ).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+            cutoff = _unread_cutoff_iso()
             cursor = chat_sessions_collection.find(
-                {
-                    "unread_admin": {"$gt": 0},
-                    "unread_tg_notified": {"$ne": True},
-                    "first_unread_at": {"$lte": cutoff, "$exists": True},
-                },
+                {"unread_admin": {"$gt": 0}},
                 {"_id": 0},
-            )
-            sessions = await cursor.to_list(length=40)
+            ).sort("last_message_at", 1)
+            sessions = await cursor.to_list(length=TG_PUSH_MAX_SESSIONS)
             for session in sessions:
-                sid = session.get("session_id")
-                if not sid:
-                    continue
-                try:
-                    await notify_unread_reminder(session)
-                    await chat_sessions_collection.update_one(
-                        {"session_id": sid},
-                        {"$set": {"unread_tg_notified": True}},
-                    )
-                except Exception as e:
-                    logger.warning("unread telegram notify failed for %s: %s", sid, e)
+                await _push_one_stale_session(session, cutoff)
         except Exception as e:
             logger.warning("maybe_notify_stale_unread failed: %s", e)
+
+
+def _is_vercel_cron(request: Request) -> bool:
+    """Vercel calls this itself once a minute. No extra password to configure."""
+    if (request.headers.get("x-vercel-cron") or "").strip() == "1":
+        return True
+    ua = (request.headers.get("user-agent") or "").strip().lower()
+    return ua.startswith("vercel-cron")
+
+
+@app.api_route("/api/internal/unread-notify", methods=["GET", "POST"])
+async def cron_unread_notify(request: Request):
+    """Minute tick so a 90s unread reminder still goes out when nobody has the site open."""
+    if not _is_vercel_cron(request):
+        raise HTTPException(status_code=401, detail="UNAUTHORIZED")
+    await maybe_notify_stale_unread(force=True)
+    return {"ok": True}
 
 
 async def send_new_session_welcome(session_id: str, language: str = "he"):
@@ -1593,7 +1766,13 @@ def utc_now_iso() -> str:
     """UTC timestamp with Z suffix for correct JS Date parsing."""
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
-async def ensure_session(session_id: str, visitor_name: str, visitor_phone: str, ip: str):
+async def ensure_session(
+    session_id: str,
+    visitor_name: str,
+    visitor_phone: str,
+    ip: str,
+    reply_lang: str = "",
+):
     now = utc_now_iso()
     result = await chat_sessions_collection.update_one(
         {"session_id": session_id},
@@ -1611,6 +1790,7 @@ async def ensure_session(session_id: str, visitor_name: str, visitor_phone: str,
                 "last_message": "",
                 "unread_admin": 0,
                 "unread_visitor": 0,
+                "reply_lang": normalize_reply_lang(reply_lang or "he"),
             },
         },
         upsert=True,
@@ -1739,15 +1919,6 @@ async def create_message_record(
     session_set = {"last_message_at": now, "last_message": preview[:100]}
     if sender == "visitor":
         session_set["last_seen_at"] = now
-        prev = await chat_sessions_collection.find_one(
-            {"session_id": session_id},
-            {"unread_admin": 1},
-        )
-        prev_unread = int((prev or {}).get("unread_admin") or 0)
-        if prev_unread <= 0:
-            # Start 90s unread reminder window when first unread arrives
-            session_set["first_unread_at"] = now
-            session_set["unread_tg_notified"] = False
     await chat_sessions_collection.update_one(
         {"session_id": session_id},
         {
@@ -1820,7 +1991,6 @@ async def create_text_message_record(
 async def create_or_get_chat_session(
     request: Request,
     data: ChatSessionCreate,
-    background_tasks: BackgroundTasks,
 ):
     ensure_mongo_context()
     await enforce_chat_rate_limit(request)
@@ -1858,7 +2028,11 @@ async def create_or_get_chat_session(
                 if stored and not hmac.compare_digest(stored, visitor_phone):
                     raise HTTPException(status_code=403, detail="SESSION_ACCESS_DENIED")
             session, is_new = await ensure_session(
-                session_id, visitor_name, visitor_phone, ip
+                session_id,
+                visitor_name,
+                visitor_phone,
+                ip,
+                reply_lang=data.language or "he",
             )
             is_brand_new_user = bool(is_new)
 
@@ -1867,9 +2041,6 @@ async def create_or_get_chat_session(
 
         if is_brand_new_user:
             await send_new_session_welcome(session_id, data.language or "he")
-            background_tasks.add_task(
-                notify_new_session, visitor_name, visitor_phone, session_id, ip
-            )
 
         return {
             "session_id": session["session_id"],
@@ -1943,9 +2114,19 @@ async def get_visitor_messages(
     cursor = chat_messages_collection.find(query, {"_id": 0}).sort("created_at", 1)
     messages = [serialize_message(m, session_id) for m in await cursor.to_list(length=2000)]
 
+    # Chat window is open. Mark staff messages read; background /sync does not.
+    read_at = utc_now_iso()
+    await chat_messages_collection.update_many(
+        {
+            "session_id": session_id,
+            "sender": "admin",
+            "read_at": {"$exists": False},
+        },
+        {"$set": {"read_at": read_at}},
+    )
     await chat_sessions_collection.update_one(
         {"session_id": session_id},
-        {"$set": {"unread_visitor": 0, "last_seen_at": utc_now_iso()}},
+        {"$set": {"unread_visitor": 0, "last_seen_at": read_at}},
     )
 
     return {"messages": messages}
@@ -1954,7 +2135,6 @@ async def get_visitor_messages(
 async def send_visitor_message(
     request: Request,
     data: ChatMessageCreate,
-    background_tasks: BackgroundTasks,
 ):
     ensure_mongo_context()
     await enforce_chat_rate_limit(request)
@@ -2000,7 +2180,6 @@ async def send_visitor_message(
 @app.post("/api/chat/upload")
 async def upload_visitor_image(
     request: Request,
-    background_tasks: BackgroundTasks,
     session_id: str = Form(...),
     file: UploadFile = File(...),
     content: str = Form(""),
@@ -2121,15 +2300,43 @@ async def get_admin_session_messages(
 
     cursor = chat_messages_collection.find(query, {"_id": 0}).sort("created_at", 1)
     messages = [serialize_message(m, session_id) for m in await cursor.to_list(length=2000)]
+    if since:
+        seen = {m.get("message_id") for m in messages}
+        read_cursor = chat_messages_collection.find(
+            {
+                "session_id": session_id,
+                "sender": "admin",
+                "read_at": {"$gte": since},
+            },
+            {"_id": 0},
+        ).sort("created_at", 1)
+        for doc in await read_cursor.to_list(length=200):
+            mid = doc.get("message_id")
+            if mid and mid not in seen:
+                messages.append(serialize_message(doc, session_id))
+                seen.add(mid)
 
+    # Only messages this response actually includes are "seen".
+    # A message that lands after the query stays eligible for the 90s push.
+    seen_times = [m.get("created_at") for m in messages if m.get("created_at")]
+    if since:
+        seen_times.append(since)
+    viewed_through = max(seen_times) if seen_times else utc_now_iso()
+    existing = await chat_sessions_collection.find_one(
+        {"session_id": session_id},
+        {"_id": 0, "tg_notified_through": 1},
+    )
+    current_through = ((existing or {}).get("tg_notified_through") or "").strip()
+    if current_through and viewed_through < current_through:
+        viewed_through = current_through
     await chat_sessions_collection.update_one(
         {"session_id": session_id},
         {
             "$set": {
                 "unread_admin": 0,
-                "unread_tg_notified": False,
+                "tg_notified_through": viewed_through,
             },
-            "$unset": {"first_unread_at": ""},
+            "$unset": {"first_unread_at": "", "unread_tg_notified": ""},
         },
     )
     return {"messages": messages}
@@ -2168,6 +2375,23 @@ async def update_session_gender(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
     return {"message": "GENDER_SAVED", "visitor_gender": gender}
+
+@app.put("/api/admin/chat/sessions/{session_id}/reply-lang")
+async def update_session_reply_lang(
+    session_id: str,
+    data: AdminSessionReplyLang,
+    token_data: dict = Depends(verify_token),
+):
+    """Outbound translation language for this chat only."""
+    ensure_mongo_context()
+    lang = normalize_reply_lang(data.reply_lang)
+    result = await chat_sessions_collection.update_one(
+        {"session_id": session_id},
+        {"$set": {"reply_lang": lang}},
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="SESSION_NOT_FOUND")
+    return {"message": "REPLY_LANG_SAVED", "reply_lang": lang}
 
 @app.post("/api/admin/chat/sessions/{session_id}/messages")
 async def send_admin_reply(

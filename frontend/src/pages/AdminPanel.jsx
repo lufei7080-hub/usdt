@@ -4,6 +4,7 @@ import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { Card } from '../components/ui/card';
 import { Badge } from '../components/ui/badge';
+import { Switch } from '../components/ui/switch';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs';
 import {
   ArrowLeftRight,
@@ -18,6 +19,7 @@ import {
   MessageSquare,
   Settings,
   Users,
+  Bot,
 } from 'lucide-react';
 import AdminChat from '../components/AdminChat';
 import { useNavigate } from 'react-router-dom';
@@ -44,10 +46,15 @@ const AdminPanel = () => {
   const [activeTab, setActiveTab] = useState('contacts');
   const [chatUnread, setChatUnread] = useState(0);
   const [selectedSessionId, setSelectedSessionId] = useState(null);
+  const [configReady, setConfigReady] = useState(false);
   const [config, setConfig] = useState({
     adminPath: '',
     adminPassword: '',
     passwordSet: false,
+    tgBot: '',
+    tgChatId: '',
+    tgPushEnabled: true,
+    browserPushEnabled: true,
   });
 
   const [isAuthenticated, setIsAuthenticated] = useState(false);
@@ -111,6 +118,8 @@ const AdminPanel = () => {
         setConfig({
           ...response.data,
           adminPassword: '',
+          tgPushEnabled: response.data.tgPushEnabled !== false,
+          browserPushEnabled: response.data.browserPushEnabled !== false,
         });
       }
     } catch (error) {
@@ -118,6 +127,8 @@ const AdminPanel = () => {
         clearSession();
         toast.error(att.sessionExpired, { description: att.sessionExpiredDesc });
       }
+    } finally {
+      setConfigReady(true);
     }
   }, [att.sessionExpired, att.sessionExpiredDesc, clearSession]);
 
@@ -168,6 +179,10 @@ const AdminPanel = () => {
       const payload = {
         adminPath: config.adminPath,
         adminPassword: (config.adminPassword || '').trim(),
+        tgBot: (config.tgBot || '').trim(),
+        tgChatId: (config.tgChatId || '').trim(),
+        tgPushEnabled: config.tgPushEnabled !== false,
+        browserPushEnabled: config.browserPushEnabled !== false,
       };
       const res = await axios.post(`${API}/admin/config`, payload, {
         headers: { Authorization: `Bearer ${token}` },
@@ -388,6 +403,7 @@ const AdminPanel = () => {
             onSelectSession={onSelectSession}
             onOpenChat={onOpenChat}
             onUnreadChange={onUnreadChange}
+            browserPushEnabled={configReady && config.browserPushEnabled !== false}
           />
         </div>
 
@@ -439,6 +455,88 @@ const AdminPanel = () => {
                     <p className="text-xs text-gray-500 mt-2">
                       {config.passwordSet ? s.passwordSet : s.passwordNotSet}
                     </p>
+                  </div>
+                </div>
+              </Card>
+
+              <Card className="glass-card p-5 md:p-6 border-sky-500/20 shadow-xl shadow-sky-500/10">
+                <div className="flex items-center justify-between gap-3 border-b border-white/10 pb-3 mb-4">
+                  <h2 className="text-lg font-bold text-white flex items-center min-w-0">
+                    <Bot className="w-5 h-5 me-2 text-sky-400 shrink-0" /> {s.telegramTitle}
+                  </h2>
+                  <span
+                    className={`text-xs shrink-0 px-2 py-0.5 rounded-full border ${
+                      config.tgPushEnabled !== false &&
+                      (config.tgBot || '').trim() &&
+                      (config.tgChatId || '').trim()
+                        ? 'text-emerald-300 border-emerald-500/40 bg-emerald-500/10'
+                        : 'text-gray-400 border-white/10 bg-white/5'
+                    }`}
+                  >
+                    {config.tgPushEnabled !== false &&
+                    (config.tgBot || '').trim() &&
+                    (config.tgChatId || '').trim()
+                      ? s.telegramOn
+                      : s.telegramOff}
+                  </span>
+                </div>
+                <p className="text-xs text-gray-400 leading-relaxed mb-4">{s.telegramHint}</p>
+                <div className="space-y-3 mb-4">
+                  <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-3 py-3">
+                    <div className="min-w-0">
+                      <p className="text-sm text-white font-medium">{s.tgPushLabel}</p>
+                      <p className="text-xs text-gray-500 mt-1 leading-relaxed">{s.tgPushHint}</p>
+                    </div>
+                    <Switch
+                      checked={config.tgPushEnabled !== false}
+                      onCheckedChange={(on) => handleInputChange('tgPushEnabled', on)}
+                      aria-label={s.tgPushLabel}
+                      className="data-[state=checked]:bg-sky-500 data-[state=unchecked]:bg-white/20"
+                    />
+                  </div>
+                  <div className="flex items-center justify-between gap-4 rounded-xl border border-white/10 bg-black/20 px-3 py-3">
+                    <div className="min-w-0">
+                      <p className="text-sm text-white font-medium">{s.browserPushLabel}</p>
+                      <p className="text-xs text-gray-500 mt-1 leading-relaxed">{s.browserPushHint}</p>
+                    </div>
+                    <Switch
+                      checked={config.browserPushEnabled !== false}
+                      onCheckedChange={(on) => handleInputChange('browserPushEnabled', on)}
+                      aria-label={s.browserPushLabel}
+                      className="data-[state=checked]:bg-emerald-500 data-[state=unchecked]:bg-white/20"
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <Label htmlFor="tgBot" className="text-gray-200 text-sm font-semibold mb-2 block">
+                      {s.tgBotLabel}
+                    </Label>
+                    <Input
+                      id="tgBot"
+                      type="password"
+                      value={config.tgBot || ''}
+                      onChange={(e) => handleInputChange('tgBot', e.target.value)}
+                      className="bg-[#0a0e1a]/80 border-sky-500/30 focus:border-sky-500 text-white h-11 font-mono"
+                      placeholder={s.tgBotPlaceholder}
+                      autoComplete="off"
+                      dir="ltr"
+                    />
+                  </div>
+                  <div>
+                    <Label htmlFor="tgChatId" className="text-gray-200 text-sm font-semibold mb-2 block">
+                      {s.tgChatIdLabel}
+                    </Label>
+                    <Input
+                      id="tgChatId"
+                      type="text"
+                      value={config.tgChatId || ''}
+                      onChange={(e) => handleInputChange('tgChatId', e.target.value)}
+                      className="bg-[#0a0e1a]/80 border-sky-500/30 focus:border-sky-500 text-white h-11 font-mono"
+                      placeholder={s.tgChatIdPlaceholder}
+                      autoComplete="off"
+                      dir="ltr"
+                    />
                   </div>
                 </div>
               </Card>

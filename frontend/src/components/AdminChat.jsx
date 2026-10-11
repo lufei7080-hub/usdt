@@ -31,6 +31,13 @@ import { resolveApiSuccess } from '../utils/apiErrors';
 import { Button } from './ui/button';
 import { Badge } from './ui/badge';
 import { Card } from './ui/card';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from './ui/select';
 import ChatMessageBubble from './ChatMessageBubble';
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 
@@ -38,7 +45,6 @@ const API = '/api';
 const SESSION_POLL_INTERVAL = 3000;
 const MESSAGE_POLL_INTERVAL = 2000;
 const PROVIDER_KEY = 'admin_translate_provider';
-const TARGET_LANG_KEY = 'admin_translate_target';
 const HISTORY_TRANSLATE_KEY = 'admin_history_translate';
 const OUTBOUND_TARGETS = ['he', 'ar', 'en'];
 
@@ -77,6 +83,7 @@ const AdminChat = ({
   onSelectSession,
   onOpenChat,
   onUnreadChange,
+  browserPushEnabled = true,
 } = {}) => {
   const { t } = useLanguage(); // for getApiErrorMessage mapping
   const ac = adminZh.chat;
@@ -91,10 +98,7 @@ const AdminChat = ({
   const [provider, setProvider] = useState(
     () => localStorage.getItem(PROVIDER_KEY) || 'google'
   );
-  const [targetLang, setTargetLang] = useState(() => {
-    const saved = (localStorage.getItem(TARGET_LANG_KEY) || 'he').toLowerCase();
-    return OUTBOUND_TARGETS.includes(saved) ? saved : 'he';
-  });
+  const [targetLang, setTargetLang] = useState('he');
   const [historyTranslate, setHistoryTranslate] = useState(() => {
     const saved = localStorage.getItem(HISTORY_TRANSLATE_KEY);
     // Default ON; only explicit "0" / "false" turns it off
@@ -146,15 +150,32 @@ const AdminChat = ({
           (s.session_id === readingId ? 0 : Number(s.unread_admin || 0)),
         0
       );
-      const rawTotal = incoming.reduce((sum, s) => sum + Number(s.unread_admin || 0), 0);
-      if (prevUnreadRef.current !== null && rawTotal > prevUnreadRef.current) {
-        showBrowserNotification({
-          title: ac.newVisitorTitle,
-          body: ac.newVisitorBody,
-          tag: 'admin-chat',
-        });
+      const incomingUnread = {};
+      for (const s of incoming) {
+        incomingUnread[s.session_id] = Number(s.unread_admin || 0);
       }
-      prevUnreadRef.current = rawTotal;
+      const prevMap = prevUnreadRef.current;
+      if (prevMap) {
+        const looking =
+          document.visibilityState === 'visible' &&
+          (typeof document.hasFocus !== 'function' || document.hasFocus());
+        for (const s of incoming) {
+          const nextUnread = incomingUnread[s.session_id] || 0;
+          const prevUnread = Number(prevMap[s.session_id] || 0);
+          if (nextUnread <= prevUnread) continue;
+          if (!browserPushEnabled) continue;
+          if (looking && readingId && s.session_id === readingId) continue;
+          const phone = (s.visitor_phone || '').trim() || '-';
+          const note = (s.admin_note || '').trim() || '无';
+          const preview = (s.last_message || '').trim() || ac.newVisitorBody;
+          showBrowserNotification({
+            title: ac.newVisitorTitle,
+            body: `号码：${phone}\n备注：${note}\n${preview}`,
+            tag: `admin-chat-${s.session_id}`,
+          });
+        }
+      }
+      prevUnreadRef.current = incomingUnread;
       setSessions(
         incoming.map((s) =>
           s.session_id === readingId ? { ...s, unread_admin: 0 } : s
@@ -173,14 +194,16 @@ const AdminChat = ({
     ac.newVisitorTitle,
     ac.newVisitorBody,
     onUnreadChange,
+    browserPushEnabled,
   ]);
 
   useEffect(() => {
+    if (!browserPushEnabled) return undefined;
     if (notificationsReadyRef.current) return undefined;
     notificationsReadyRef.current = true;
     requestNotificationPermission();
     return undefined;
-  }, []);
+  }, [browserPushEnabled]);
 
   const fetchMessages = useCallback(
     async (sessionId, since = null, fullLoad = false) => {
@@ -540,16 +563,42 @@ const AdminChat = ({
     setTimeout(() => setTranslateStatus(''), 1600);
   };
 
-  const switchTargetLang = (lang) => {
+  useEffect(() => {
+    if (!selectedSessionId) return;
+    const lang = (selectedSession?.reply_lang || 'he').toLowerCase();
+    setTargetLang(OUTBOUND_TARGETS.includes(lang) ? lang : 'he');
+  }, [selectedSessionId, selectedSession?.reply_lang]);
+
+  const switchTargetLang = async (lang) => {
     const next = OUTBOUND_TARGETS.includes(lang) ? lang : 'he';
+    if (!selectedSessionId || next === targetLang) return;
+    const prev = targetLang;
     setTargetLang(next);
-    localStorage.setItem(TARGET_LANG_KEY, next);
     setSendHe('');
     setPendingOriginal('');
-    const label =
-      next === 'ar' ? ac.targetAr : next === 'en' ? ac.targetEn : ac.targetHe;
-    setTranslateStatus(`${ac.targetLangLabel}：${label}`);
-    setTimeout(() => setTranslateStatus(''), 1600);
+    setSessions((list) =>
+      list.map((s) => (s.session_id === selectedSessionId ? { ...s, reply_lang: next } : s))
+    );
+    const label = next === 'ar' ? ac.targetAr : next === 'en' ? ac.targetEn : ac.targetHe;
+    try {
+      await axios.put(
+        `${API}/admin/chat/sessions/${selectedSessionId}/reply-lang`,
+        { reply_lang: next },
+        { headers: { Authorization: `Bearer ${getToken()}` } }
+      );
+      setTargetLang(next);
+      setSessions((list) =>
+        list.map((s) => (s.session_id === selectedSessionId ? { ...s, reply_lang: next } : s))
+      );
+      setTranslateStatus(`${ac.targetLangLabel}：${label}`);
+      setTimeout(() => setTranslateStatus(''), 1600);
+    } catch (err) {
+      setTargetLang(prev);
+      setSessions((list) =>
+        list.map((s) => (s.session_id === selectedSessionId ? { ...s, reply_lang: prev } : s))
+      );
+      toast.error(getApiErrorMessage(err, ac.operationFailed, t));
+    }
   };
 
   const toggleHistoryTranslate = () => {
@@ -1050,27 +1099,26 @@ const AdminChat = ({
               {ac.providerDeepseek}
             </Button>
           </div>
-          <div className="flex items-center gap-1.5" title={ac.targetLangLabel}>
-            {[
-              { code: 'he', label: ac.targetHe },
-              { code: 'ar', label: ac.targetAr },
-              { code: 'en', label: ac.targetEn },
-            ].map(({ code, label }) => (
-              <Button
-                key={code}
-                type="button"
-                size="sm"
-                className={`h-7 text-[11px] px-2.5 shrink-0 border ${
-                  targetLang === code
-                    ? 'bg-amber-600 hover:bg-amber-500 text-white border-amber-400/40'
-                    : 'bg-amber-950/30 text-amber-200/80 border-amber-800/40 hover:bg-amber-900/40'
-                }`}
-                onClick={() => switchTargetLang(code)}
-              >
-                {label}
-              </Button>
-            ))}
-          </div>
+          <Select value={targetLang} onValueChange={switchTargetLang}>
+            <SelectTrigger
+              className="h-7 w-[7.25rem] shrink-0 text-[11px] px-2 bg-amber-950/40 text-amber-100 border-amber-700/50 hover:bg-amber-900/50 focus:ring-amber-500/40"
+              title={ac.targetLangLabel}
+              aria-label={ac.targetLangLabel}
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent className="bg-[#0a0e1a] border-white/10 text-gray-100">
+              <SelectItem value="he" className="text-[12px] focus:bg-white/10 focus:text-white">
+                {ac.targetHe}
+              </SelectItem>
+              <SelectItem value="ar" className="text-[12px] focus:bg-white/10 focus:text-white">
+                {ac.targetAr}
+              </SelectItem>
+              <SelectItem value="en" className="text-[12px] focus:bg-white/10 focus:text-white">
+                {ac.targetEn}
+              </SelectItem>
+            </SelectContent>
+          </Select>
           <Button
             type="button"
             size="sm"

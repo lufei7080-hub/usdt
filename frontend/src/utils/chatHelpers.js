@@ -13,7 +13,10 @@ export const mergeMessages = (prev, incoming) => {
 
     if (serverId && clientId) {
       map.delete(clientId);
-      map.set(serverId, { ...msg, status: undefined });
+      const existing = map.get(serverId);
+      const next = { ...msg, status: undefined };
+      if (existing?.read_at && !next.read_at) next.read_at = existing.read_at;
+      map.set(serverId, next);
       return;
     }
 
@@ -21,6 +24,8 @@ export const mergeMessages = (prev, incoming) => {
       const existing = map.get(serverId);
       if (!existing || existing.status === 'pending') {
         map.set(serverId, { ...msg, status: undefined });
+      } else if (msg.read_at && existing.read_at !== msg.read_at) {
+        map.set(serverId, { ...existing, read_at: msg.read_at });
       }
       return;
     }

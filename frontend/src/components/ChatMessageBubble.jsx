@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from 'react';
 import { useLanguage } from '../contexts/LanguageContext';
 import { formatChatTime, resolveChatImageUrl, linkifyTextParts } from '../utils/chatHelpers';
-import { Loader2, AlertCircle, ImageIcon, Trash2 } from 'lucide-react';
+import { Loader2, AlertCircle, ImageIcon, Trash2, Check, CheckCheck } from 'lucide-react';
 import ChatImageViewer from './ChatImageViewer';
 import { adminZh } from '../i18n/adminZh';
 
@@ -198,6 +198,13 @@ const ChatMessageBubble = ({
             </p>
             {isPending && <Loader2 className="w-3 h-3 animate-spin" />}
             {isFailed && <AlertCircle className="w-3 h-3 text-red-400" />}
+            {showAdminLayout && isOwn && !isPending && !isFailed && msg.message_id ? (
+              msg.read_at ? (
+                <CheckCheck className="w-3.5 h-3.5 text-sky-400 shrink-0" aria-label="已读" />
+              ) : (
+                <Check className="w-3.5 h-3.5 text-gray-400 shrink-0" aria-label="已发送" />
+              )
+            ) : null}
           </div>
           {isFailed && onRetry && (
             <button

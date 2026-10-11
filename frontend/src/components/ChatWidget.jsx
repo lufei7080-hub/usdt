@@ -106,13 +106,20 @@ const ChatWidget = () => {
     );
   }, []);
 
+  const [browserPushEnabled, setBrowserPushEnabled] = useState(null);
+
   const notifyNewAdminMessages = useCallback((serverMsgs) => {
+    if (!browserPushEnabled) return;
     const adminMsgs = (serverMsgs || []).filter((m) => m.sender === 'admin' && m.message_id);
     if (!adminMsgs.length) return;
     const latest = adminMsgs[adminMsgs.length - 1];
     const key = latest.message_id || latest.created_at;
     if (!key) return;
-    if (lastAdminMsgKeyRef.current && key !== lastAdminMsgKeyRef.current) {
+    const lookingAtChat =
+      isOpenRef.current &&
+      document.visibilityState === 'visible' &&
+      (typeof document.hasFocus !== 'function' || document.hasFocus());
+    if (lastAdminMsgKeyRef.current && key !== lastAdminMsgKeyRef.current && !lookingAtChat) {
       showBrowserNotification({
         title: t.chat.newMessageTitle,
         body: latest.content?.trim() || t.chat.newMessageBody,
@@ -121,7 +128,7 @@ const ChatWidget = () => {
       });
     }
     lastAdminMsgKeyRef.current = key;
-  }, [t]);
+  }, [t, browserPushEnabled]);
 
   const applyMessages = useCallback((incoming, isIncremental = false) => {
     setMessages((prev) => {
@@ -269,11 +276,27 @@ const ChatWidget = () => {
   ]);
 
   useEffect(() => {
-    if (needsRegister || notificationsReadyRef.current) return undefined;
+    let cancelled = false;
+    axios
+      .get(`${API}/config`, { timeout: 8000 })
+      .then((res) => {
+        if (cancelled) return;
+        setBrowserPushEnabled(res.data?.browserPushEnabled !== false);
+      })
+      .catch(() => {
+        if (!cancelled) setBrowserPushEnabled(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (needsRegister || !browserPushEnabled || notificationsReadyRef.current) return undefined;
     notificationsReadyRef.current = true;
     requestNotificationPermission();
     return undefined;
-  }, [needsRegister]);
+  }, [needsRegister, browserPushEnabled]);
 
   const postVisitorImage = useCallback(
     async (file, clientMessageId, content = '') => {
