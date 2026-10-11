@@ -18,12 +18,6 @@
       }
     }
   ],
-  "crons": [
-    {
-      "path": "/api/internal/unread-notify",
-      "schedule": "* * * * *"
-    }
-  ],
   "routes": [
     {
       "src": "/api/(.*)",

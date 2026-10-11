@@ -152,6 +152,8 @@ REPLY_LANGS = ("he", "ar", "en")
 TG_PUSH_MAX_SESSIONS = 10
 TG_PUSH_MAX_MESSAGES = 8
 TG_PUSH_MAX_CHARS = 3500
+# Fixed key for an external once-a-minute caller. Not an environment variable.
+UNREAD_NOTIFY_KEY = "q7Nw4Km9Xp2Lv8Rt6Yb3Hc1Jd5Fs0AeU"
 _last_cleanup_run_at = 0.0
 _last_unread_notify_check_at = 0.0
 _cleanup_lock = asyncio.Lock()
@@ -1666,18 +1668,30 @@ async def maybe_notify_stale_unread(force: bool = False):
             logger.warning("maybe_notify_stale_unread failed: %s", e)
 
 
-def _is_vercel_cron(request: Request) -> bool:
-    """Vercel calls this itself once a minute. No extra password to configure."""
-    if (request.headers.get("x-vercel-cron") or "").strip() == "1":
+def _secret_match(provided: str, expected: str) -> bool:
+    if not provided or len(provided) != len(expected):
+        return False
+    return hmac.compare_digest(provided, expected)
+
+
+def _cron_authorized(request: Request) -> bool:
+    """Accept the fixed key via Bearer, x-cron-secret, or ?key=."""
+    auth = (request.headers.get("authorization") or "").strip()
+    if auth.lower().startswith("bearer "):
+        auth = auth[7:].strip()
+    if _secret_match(auth, UNREAD_NOTIFY_KEY):
         return True
-    ua = (request.headers.get("user-agent") or "").strip().lower()
-    return ua.startswith("vercel-cron")
+    header = (request.headers.get("x-cron-secret") or "").strip()
+    if _secret_match(header, UNREAD_NOTIFY_KEY):
+        return True
+    key = (request.query_params.get("key") or "").strip()
+    return _secret_match(key, UNREAD_NOTIFY_KEY)
 
 
 @app.api_route("/api/internal/unread-notify", methods=["GET", "POST"])
 async def cron_unread_notify(request: Request):
-    """Minute tick so a 90s unread reminder still goes out when nobody has the site open."""
-    if not _is_vercel_cron(request):
+    """External minute tick so a 90s unread reminder still goes out when nobody has the site open."""
+    if not _cron_authorized(request):
         raise HTTPException(status_code=401, detail="UNAUTHORIZED")
     await maybe_notify_stale_unread(force=True)
     return {"ok": True}
